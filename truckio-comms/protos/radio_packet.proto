@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package truckio.comms;
+
+message RadioPacket {
+  optional bytes payload = 1;
+  optional bytes nonce = 2;
+  optional uint32 to = 3;
+}
