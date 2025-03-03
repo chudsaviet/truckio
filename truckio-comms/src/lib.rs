@@ -1,17 +1,23 @@
 #![no_std]
 
-use chacha20poly1305::aead::{Aead, AeadMutInPlace};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::aead::heapless::Vec;
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use defmt::*;
 use embedded_hal_async::delay::DelayNs;
 use lora_phy::mod_params::{ModulationParams, PacketParams};
 use lora_phy::mod_traits::RadioKind;
 use lora_phy::{LoRa, RxMode};
+use microbloom::MicroBloom;
 use micropb::PbDecoder;
 
 mod protos;
 use protos::truckio_::comms_::command_::Command;
 use protos::truckio_::comms_::RadioPacket;
+
+const BLOOM_FILTER_SIZE: usize = 256;
+const BLOOM_FILTER_NUM_HASHES: u8 = 3;
+const BLOOM_RESET_SIZE: u32 = 2000;
 
 pub enum CommsError {
     Unspecified,
@@ -21,7 +27,8 @@ pub enum CommsError {
     IncompletePacketError,
     IncompleteCommandError,
     DecryptError,
-    ToVerificationError
+    ToVerificationError,
+    MessageAlreadyReceivedError,
 }
 
 pub struct TruckIOComms<RK, DLY>
@@ -34,13 +41,14 @@ where
     rx_pkt_params: PacketParams,
     address: u32,
     cipher: ChaCha20Poly1305,
+    bloom: MicroBloom<BLOOM_FILTER_SIZE, BLOOM_FILTER_NUM_HASHES>,
+    bloom_counter: u32,
 }
 
 const PREAMBLE_LEN: u16 = 4;
 const RADIO_RECEIVE_TIMEOUT_MS: u16 = 2000;
 
-// u8 is important since its the type used in LoRa library.
-const RECEIVING_BUFFER_SIZE_BYTES: u8 = 128;
+const RECEIVING_BUFFER_SIZE: usize = 64;
 
 impl<RK, DLY> TruckIOComms<RK, DLY>
 where
@@ -57,7 +65,7 @@ where
             match lora.create_rx_packet_params(
                 PREAMBLE_LEN as u16,         // preamble_length
                 false,                       // implicit_header
-                RECEIVING_BUFFER_SIZE_BYTES, // max_payload_length
+                RECEIVING_BUFFER_SIZE as u8, // max_payload_length
                 true,                        // crc_on
                 false,                       // iq_inverted
                 &modulation_params,          // modulation_params
@@ -71,6 +79,8 @@ where
         };
 
         let cipher = ChaCha20Poly1305::new(&crypto_key.into());
+        let bloom = MicroBloom::new();
+        let bloom_counter: u32 = 0;
 
         let comms = Self {
             lora,
@@ -78,6 +88,8 @@ where
             rx_pkt_params,
             address,
             cipher,
+            bloom,
+            bloom_counter,
         };
 
         // Do any actions required for LoRa and/or crypto initialization.
@@ -87,7 +99,7 @@ where
 
     async fn radio_receive(
         &mut self,
-        buffer: &mut [u8; RECEIVING_BUFFER_SIZE_BYTES as usize],
+        buffer: &mut [u8; RECEIVING_BUFFER_SIZE],
     ) -> Result<u8, CommsError> {
         match self
             .lora
@@ -116,9 +128,15 @@ where
         };
     }
 
+    fn bloom_insert(&mut self, value: &[u8]) {
+        if self.bloom_counter >= BLOOM_RESET_SIZE {
+            self.bloom = MicroBloom::new();
+        }
+        self.bloom.insert(value);
+    }
+
     pub async fn receive(&mut self) -> Result<Command, CommsError> {
-        let mut buffer: [u8; RECEIVING_BUFFER_SIZE_BYTES as usize] =
-            [00u8; RECEIVING_BUFFER_SIZE_BYTES as usize];
+        let mut buffer: [u8; RECEIVING_BUFFER_SIZE] = [00u8; RECEIVING_BUFFER_SIZE];
 
         let received_bytes: u8 = match self.radio_receive(&mut buffer).await {
             Ok(x) => x,
@@ -128,7 +146,7 @@ where
         let mut rp_decoder = PbDecoder::new(&buffer[0..received_bytes as usize]);
         let radio_packet: RadioPacket = match rp_decoder.decode_message(received_bytes as usize) {
             Ok(x) => x,
-            Err(e) => {
+            Err(_) => {
                 error!("Protobuf `RadioPacket` decode error.");
                 return Err(CommsError::PbDecodeError);
             }
@@ -144,27 +162,30 @@ where
             return Err(CommsError::ToAddressWrongError);
         }
 
-        // TODO(chudsaviet): Add Bloom filter for nonces.
+        if self.bloom.check(&radio_packet.nonce) {
+            debug!("Message with this nonce was already received. A bloom filter is used, therefore it can be a false positive.");
+            return Err(CommsError::MessageAlreadyReceivedError);
+        }
+        self.bloom_insert(&radio_packet.nonce);
 
-        let mut decrypt_buffer: [u8; RECEIVING_BUFFER_SIZE_BYTES as usize] =
-            [00u8; RECEIVING_BUFFER_SIZE_BYTES as usize];
+        let mut decrypt_buffer: Vec<u8, RECEIVING_BUFFER_SIZE> = Vec::new();
 
         match self.cipher.decrypt_in_place(
-            &radio_packet.nonce.into(),
+            Nonce::from_slice(&radio_packet.nonce),
             &radio_packet.payload,
-            &mut decrypt_buffer.into(),
+            &mut decrypt_buffer,
         ) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 error!("Decrypt error.");
                 return Err(CommsError::DecryptError);
-            },
+            }
         }
 
         let mut p_decoder = PbDecoder::new(&decrypt_buffer[0..radio_packet.payload.len()]);
         let command: Command = match p_decoder.decode_message(radio_packet.payload.len()) {
             Ok(x) => x,
-            Err(e) => {
+            Err(_) => {
                 error!("Protobuf `Command` decode error.");
                 return Err(CommsError::PbDecodeError);
             }
