@@ -1,19 +1,22 @@
 #![no_std]
 
-use chacha20poly1305::aead::heapless::Vec;
 use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::aead::heapless::Vec;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use defmt::*;
 use embedded_hal_async::delay::DelayNs;
 use lora_phy::mod_params::{ModulationParams, PacketParams};
 use lora_phy::mod_traits::RadioKind;
 use lora_phy::{LoRa, RxMode};
+use lora_wrapper::LoRaWrapper;
 use microbloom::MicroBloom;
 use micropb::PbDecoder;
 
 mod protos;
-use protos::truckio_::comms_::command_::Command;
 use protos::truckio_::comms_::RadioPacket;
+use protos::truckio_::comms_::command_::Command;
+
+mod lora_wrapper;
 
 const BLOOM_FILTER_SIZE: usize = 256;
 const BLOOM_FILTER_NUM_HASHES: u8 = 3;
@@ -36,7 +39,7 @@ where
     RK: RadioKind,
     DLY: DelayNs,
 {
-    lora: LoRa<RK, DLY>,
+    lora: LoRaWrapper<RK, DLY>,
     modulation_params: ModulationParams,
     rx_pkt_params: PacketParams,
     address: u32,
@@ -56,7 +59,7 @@ where
     DLY: DelayNs,
 {
     pub fn new(
-        mut lora: LoRa<RK, DLY>,
+        mut lora: LoRaWrapper<RK, DLY>,
         modulation_params: ModulationParams,
         address: u32,
         crypto_key: [u8; 32],
@@ -163,7 +166,9 @@ where
         }
 
         if self.bloom.check(&radio_packet.nonce) {
-            debug!("Message with this nonce was already received. A bloom filter is used, therefore it can be a false positive.");
+            debug!(
+                "Message with this nonce was already received. A bloom filter is used, therefore it can be a false positive."
+            );
             return Err(CommsError::MessageAlreadyReceivedError);
         }
         self.bloom_insert(&radio_packet.nonce);
@@ -204,3 +209,6 @@ where
         Ok(command)
     }
 }
+
+#[cfg(test)]
+mod lib_test;
