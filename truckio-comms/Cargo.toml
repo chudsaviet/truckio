@@ -12,9 +12,15 @@ micropb = { version = "0.1.0", features = ["container-heapless"] }
 sbbf-rs = "0.2.8"
 microbloom = { git = "https://github.com/chudsaviet/microbloom.git", rev = "38fa1bdeef2ccdffaab1547f0abb3a744b8c0458" }
 
+
 [dev-dependencies]
+embassy-time = "0.4.0"
+mockall_double = "0.3.1"
 mockall = "0.13.1"
 
 [build-dependencies]
 glob = "0.3.2"
 micropb-gen = "0.1.0"
+
+[features]
+no_std = []
