@@ -5,11 +5,13 @@ use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use defmt::*;
 use embedded_hal_async::delay::DelayNs;
+use frand::Rand;
 use lora_phy::mod_params::{ModulationParams, PacketParams};
 use lora_phy::mod_traits::RadioKind;
 use lora_phy::{LoRa, RxMode};
 use microbloom::MicroBloom;
-use micropb::PbDecoder;
+use micropb::MessageEncode;
+use micropb::{heapless::Vec as MicropbVec, PbDecoder, PbEncoder};
 
 mod protos;
 use protos::truckio_::comms_::command_::Command;
@@ -17,12 +19,20 @@ use protos::truckio_::comms_::RadioPacket;
 
 const BLOOM_FILTER_SIZE: usize = 256;
 const BLOOM_FILTER_NUM_HASHES: u8 = 3;
-const BLOOM_RESET_SIZE: u32 = 2000;
+const BLOOM_HARD_RESET_LIMIT: u32 = 4000;
+// Bloom filter shall randomly reset approximately once per 2000 inserts.
+const BLOOM_RESET_PROBABILITY_MILLIPERCENT: u32 = 5;
+const NONCE_LENGTH: usize = 12;
+const PB_ENCODER_MAX_BYTES: usize = 128;
+const PAYLOAD_MAX_SIZE: usize = 64;
+const PACKET_MAX_SIZE: usize = 128;
 
+#[derive(Debug, Format)]
 pub enum CommsError {
     Unspecified,
     RadioError,
     PbDecodeError,
+    PbEncodeError,
     ToAddressWrongError,
     IncompletePacketError,
     IncompleteCommandError,
@@ -37,6 +47,8 @@ where
     DLY: DelayNs,
 {
     lora: LoRa<RK, DLY>,
+    rand: Rand,
+    pb_encoder: PbEncoder<MicropbVec<u8, PB_ENCODER_MAX_BYTES>>,
     modulation_params: ModulationParams,
     rx_pkt_params: PacketParams,
     address: u32,
@@ -57,6 +69,7 @@ where
 {
     pub fn new(
         mut lora: LoRa<RK, DLY>,
+        mut rand: Rand,
         modulation_params: ModulationParams,
         address: u32,
         crypto_key: [u8; 32],
@@ -81,9 +94,12 @@ where
         let cipher = ChaCha20Poly1305::new(&crypto_key.into());
         let bloom = MicroBloom::new();
         let bloom_counter: u32 = 0;
+        let pb_encoder = PbEncoder::new(MicropbVec::<u8, PB_ENCODER_MAX_BYTES>::new());
 
         let comms = Self {
             lora,
+            rand,
+            pb_encoder,
             modulation_params,
             rx_pkt_params,
             address,
@@ -129,9 +145,15 @@ where
     }
 
     fn bloom_insert(&mut self, value: &[u8]) {
-        if self.bloom_counter >= BLOOM_RESET_SIZE {
+        // To avoid Bloom filter overflow, we reset it when it grows too much.
+        // To make reset less perdictable, we also reset it on each insert with some probability.
+        if self.bloom_counter >= BLOOM_HARD_RESET_LIMIT
+            || self.rand.gen_range(0..10000u32) < BLOOM_RESET_PROBABILITY_MILLIPERCENT
+        {
             self.bloom = MicroBloom::new();
+            self.bloom_counter = 0;
         }
+        self.bloom_counter += 1;
         self.bloom.insert(value);
     }
 
@@ -202,5 +224,84 @@ where
         }
 
         Ok(command)
+    }
+
+    fn replace_rand(&mut self, rand: Rand) {
+        self.rand = rand;
+    }
+
+    fn gen_nonce(&mut self) -> MicropbVec<u8, NONCE_LENGTH> {
+        let mut nonce: MicropbVec<u8, NONCE_LENGTH> = MicropbVec::new();
+
+        for i in 1..(NONCE_LENGTH / 4) {
+            let num: u32 = self.rand.r#gen();
+            nonce.extend(num.to_le_bytes());
+        }
+
+        nonce
+    }
+
+    fn build_packet(&mut self, command: Command, to: u32) -> Result<RadioPacket, CommsError> {
+        match command.encode(&mut self.pb_encoder) {
+            Ok(x) => x,
+            Err(e) => {
+                error!("Can't encode Command Protobuf! {}", e);
+                return Err(CommsError::PbEncodeError);
+            }
+        };
+
+        let mut payload: MicropbVec<u8, PAYLOAD_MAX_SIZE> = MicropbVec::new();
+        match payload.extend_from_slice(self.pb_encoder.as_writer()) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Command serialization error. {}", e);
+                return Err(CommsError::PbEncodeError);
+            }
+        }
+
+        let packet: RadioPacket = RadioPacket {
+            payload,
+            nonce: self.gen_nonce(),
+            to,
+            ..Default::default()
+        };
+
+        return Ok(packet);
+    }
+
+    fn build_encoded_packet(
+        &mut self,
+        command: Command,
+        to: u32,
+    ) -> Result<MicropbVec<u8, PACKET_MAX_SIZE>, CommsError> {
+        let packet = match self.build_packet(command, to) {
+            Ok(x) => x,
+            Err(e) => {
+                error!("Can't build packet. {}", e);
+                return Err(e);
+            }
+        };
+
+        match packet.encode(&mut self.pb_encoder) {
+            Ok(x) => x,
+            Err(e) => {
+                error!("Can't encode RadioPacket Protobuf! {}", e);
+                return Err(CommsError::PbEncodeError);
+            }
+        };
+
+        let mut encoded_packet: MicropbVec<u8, PACKET_MAX_SIZE> = MicropbVec::new();
+        match encoded_packet.extend_from_slice(self.pb_encoder.as_writer()) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Command serialization error. {}", e);
+                return Err(CommsError::PbEncodeError);
+            }
+        };
+        return Ok(encoded_packet);
+    }
+
+    fn transmit(&mut self, command: Command, address: u32) -> Result<(), CommsError> {
+        Ok(())
     }
 }
