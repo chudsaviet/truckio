@@ -25,6 +25,10 @@ fn protos_generate() {
             ".truckio.comms.RadioPacket.nonce",
             Config::new().max_bytes(12),
         )
+        .configure(
+            ".truckio.comms.command.Command.nonce",
+            Config::new().max_bytes(12),
+        )
         .compile_protos(
             &protos,
             std::env::var("OUT_DIR").unwrap() + "/protos_generated.rs",

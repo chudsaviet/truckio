@@ -13,4 +13,5 @@ message Command {
   optional CommandType type = 1;
   optional uint32 to = 2;
   optional uint32 from = 3;
+  optional bytes nonce = 4;
 }

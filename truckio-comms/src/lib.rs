@@ -5,6 +5,7 @@ use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce as CryptoNonce};
 use defmt::*;
 use embassy_futures::select::select;
+use embassy_futures::select::Either;
 use embassy_time::Timer;
 use embedded_hal_async::delay::DelayNs;
 use frand::Rand;
@@ -31,7 +32,6 @@ const PACKET_MAX_SIZE: usize = 128;
 
 // Transmit is retried with exponential fuzzed delay.
 const TRANSMIT_RETRIES: u8 = 5;
-const TRANSMIT_ACK_WAIT_MS: u32 = 97;
 const TRANSMIT_BASE_DELAY_MS: f32 = 41.0;
 const TRANSMIT_DELAY_MULTIPIER: f32 = 1.3;
 const TRANSMIT_DELAY_FUZZ: f32 = 1.3;
@@ -51,6 +51,7 @@ pub enum CommsError {
     ToVerificationError,
     MessageAlreadyReceivedError,
     NoAckReceived,
+    TransmitError,
 }
 
 pub struct TruckIOComms<RK, DLY>
@@ -181,7 +182,27 @@ where
         self.bloom.insert(value);
     }
 
-    pub async fn receive(&mut self) -> Result<Command, CommsError> {
+    async fn send_ack(&mut self, to: u32, nonce: NonceVec) -> Result<(), CommsError> {
+        let command = Command {
+            to: to,
+            from: self.address,
+            r#type: CommandType::Ack,
+            nonce: nonce,
+            ..Default::default()
+        };
+        // transmit_once() here is importand to avoid transmit-ack-transmit-ack infinite loop.
+        let nonce = self.gen_nonce();
+        match self.transmit_once(command, to, nonce).await {
+            Ok(()) => {}
+            Err(e) => {
+                error!("Can't transmit ACK. {}", e);
+                return Err(e);
+            }
+        };
+        Ok(())
+    }
+
+    pub async fn receive(&mut self, reply_ack: bool) -> Result<Command, CommsError> {
         let mut buffer: [u8; RECEIVING_BUFFER_SIZE] = [00u8; RECEIVING_BUFFER_SIZE];
 
         let received_bytes: u8 = match self.radio_receive(&mut buffer).await {
@@ -245,6 +266,16 @@ where
         if command.to != radio_packet.to {
             debug!("`to` field verification error. Probably radio packet was compromised.");
             return Err(CommsError::ToVerificationError);
+        }
+
+        if reply_ack {
+            match self.send_ack(command.from, radio_packet.nonce).await {
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Can't transmit ACK. {}", e);
+                    return Err(CommsError::TransmitError);
+                }
+            }
         }
 
         Ok(command)
@@ -376,7 +407,8 @@ where
 
     async fn wait_for_ack(&mut self, nonce: &NonceVec, from: u32) -> Result<(), CommsError> {
         loop {
-            let command = match self.receive().await {
+            // Don't send ACK to ACK.
+            let command = match self.receive(false).await {
                 Ok(x) => x,
                 Err(e) => {
                     error!("Wait for ACK error. {}", e);
@@ -388,6 +420,8 @@ where
                 && command.r#type != CommandType::Ack
                 && command._has.from()
                 && command.from == from
+                && command._has.nonce()
+                && command.nonce.eq(nonce)
             {
                 debug!("ACK command from {} received.", from);
                 break;
@@ -398,9 +432,16 @@ where
     }
 
     pub async fn transmit(&mut self, command: Command, to: u32) -> Result<(), CommsError> {
+        if !command._has.r#type() {
+            error!("Command shall have type to transmit.");
+            return Err(CommsError::IncompleteCommandError);
+        }
+
+        debug!("Transmitting {} command.", command.r#type);
         let mut delay: f32 = TRANSMIT_BASE_DELAY_MS;
         for i in 0..TRANSMIT_RETRIES {
             let nonce = self.gen_nonce();
+            debug!("Transmitting new command {}.", command.r#type);
             match self.transmit_once(command.clone(), to, nonce.clone()).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -413,20 +454,27 @@ where
             let ack_future = self.wait_for_ack(&nonce, to);
             let timeout_future = Timer::after_millis(delay as u64);
 
-            //match select::<_, Timer>(ack_future, timeout_future) {}
-
-            // match {
-            //     Ok(_) => {
-            //         debug!("Transmit to {} successful, ACK received.", to);
-            //         return Ok(());
-            //     }
-            //     Err(e) => {
-            //         debug!(
-            //             "ACK from {} not received within timeout or error happened. {}",
-            //             to, e
-            //         );
-            //     }
-            // };
+            match select(ack_future, timeout_future).await {
+                Either::First(x) => {
+                    // ACK received.
+                    match x {
+                        Ok(_) => {
+                            debug!("Transmit to {} successful, ACK received.", to);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            debug!(
+                                "ACK from {} not received within timeout or error happened. {}",
+                                to, e
+                            );
+                        }
+                    };
+                }
+                Either::Second(_) => {
+                    // Timeout passed.
+                    debug!("Timeout of {} ms passed.", delay);
+                }
+            }
 
             delay *= TRANSMIT_DELAY_MULTIPIER * self.rand.gen_range(0.0..TRANSMIT_DELAY_FUZZ);
         }
