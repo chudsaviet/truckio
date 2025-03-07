@@ -4,11 +4,13 @@ package truckio.comms.command;
 
 enum CommandType {
   UNKNOWN = 0;
-  OFF = 1;
+  ACK = 1;
   ON = 2;
+  OFF = 3;
 }
 
 message Command {
   optional CommandType type = 1;
   optional uint32 to = 2;
+  optional uint32 from = 3;
 }
