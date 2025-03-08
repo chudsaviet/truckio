@@ -14,8 +14,9 @@ fn protos_generate() {
         })
         .collect::<Vec<String>>();
 
-    let mut gen = Generator::new();
-    gen.use_container_heapless()
+    let mut pbgen = Generator::new();
+    pbgen
+        .use_container_heapless()
         .add_protoc_arg("-Iprotos")
         .configure(
             ".truckio.comms.RadioPacket.payload",
