@@ -1,11 +1,12 @@
 #![no_std]
 
-use chacha20poly1305::aead::heapless::Vec;
 use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::aead::heapless::Vec;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce as CryptoNonce};
+use defmt::Format;
 use defmt::*;
-use embassy_futures::select::select;
 use embassy_futures::select::Either;
+use embassy_futures::select::select;
 use embassy_time::Timer;
 use embedded_hal_async::delay::DelayNs;
 use frand::Rand;
@@ -14,11 +15,11 @@ use lora_phy::mod_traits::RadioKind;
 use lora_phy::{LoRa, RxMode};
 use microbloom::MicroBloom;
 use micropb::MessageEncode;
-use micropb::{heapless::Vec as MicropbVec, PbDecoder, PbEncoder};
+use micropb::{PbDecoder, PbEncoder, heapless::Vec as MicropbVec};
 
 mod protos;
-use protos::truckio_::comms_::command_::{Command, CommandType};
 use protos::truckio_::comms_::RadioPacket;
+use protos::truckio_::comms_::command_::{Command, CommandType};
 
 const BLOOM_FILTER_SIZE: usize = 256;
 const BLOOM_FILTER_NUM_HASHES: u8 = 3;
@@ -38,7 +39,7 @@ const TRANSMIT_DELAY_FUZZ: f32 = 1.3;
 
 type NonceVec = MicropbVec<u8, NONCE_LENGTH>;
 
-#[derive(Debug, Format)]
+#[derive(Format)]
 pub enum CommsError {
     Unspecified,
     RadioError,
@@ -230,7 +231,9 @@ where
         }
 
         if self.bloom.check(&radio_packet.nonce) {
-            debug!("Message with this nonce was already received. A bloom filter is used, therefore it can be a false positive.");
+            debug!(
+                "Message with this nonce was already received. A bloom filter is used, therefore it can be a false positive."
+            );
             return Err(CommsError::MessageAlreadyReceivedError);
         }
         self.bloom_insert(&radio_packet.nonce);
@@ -437,11 +440,11 @@ where
             return Err(CommsError::IncompleteCommandError);
         }
 
-        debug!("Transmitting {} command.", command.r#type);
+        debug!("Transmitting command.");
         let mut delay: f32 = TRANSMIT_BASE_DELAY_MS;
         for i in 0..TRANSMIT_RETRIES {
             let nonce = self.gen_nonce();
-            debug!("Transmitting new command {}.", command.r#type);
+            debug!("Transmitting new command.");
             match self.transmit_once(command.clone(), to, nonce.clone()).await {
                 Ok(()) => {}
                 Err(e) => {
